@@ -16,8 +16,16 @@ from pathlib import Path
 
 def read_folder(path: str | Path) -> list[tuple[str, bytes]]:
     """Returns (message_id, raw_bytes) for every `*.eml` file in `path`,
-    sorted by filename so results are deterministic across runs."""
+    sorted by filename so results are deterministic across runs.
+
+    Raises `FileNotFoundError` if `path` does not exist or is not a
+    directory -- a missing source is a distinct error, not an empty
+    mailbox, and must never be read as "zero messages" (see `cmd_ingest`,
+    which refuses to publish over a previous good output when this
+    raises)."""
     folder = Path(path)
+    if not folder.is_dir():
+        raise FileNotFoundError(f"folder source does not exist or is not a directory: {folder}")
     out = []
     for f in sorted(folder.glob("*.eml")):
         out.append((f.stem, f.read_bytes()))

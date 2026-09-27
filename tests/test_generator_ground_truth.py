@@ -1,8 +1,11 @@
 """Known-total reconciliation: the generator records the true orders and
 totals it wrote into the .eml corpus, and the parser's output must match
-them exactly -- order for order, cent for cent, and every deliberately-bad
-message must land in exceptions under the category the generator intended.
+them exactly -- order for order, cent for cent, item for item -- and every
+deliberately-bad message must land in exceptions under the category the
+generator intended.
 """
+import json
+
 from email_orders.cli import run_ingest
 from email_orders.imap_source import read_folder
 
@@ -26,6 +29,16 @@ def test_orders_match_generator_ground_truth(corpus):
         assert got.currency == spec.currency
         assert got.total == spec.total, f"{spec.order_id}: {got.total} != {spec.total}"
         assert got.item_count == len(spec.items)
+
+        # Compare every extracted item value, not just the count: name,
+        # quantity and unit price for each line, in the order the
+        # generator wrote them.
+        got_items = json.loads(got.items_json)
+        assert len(got_items) == len(spec.items)
+        for got_item, spec_item in zip(got_items, spec.items):
+            assert got_item["name"] == spec_item.name, spec.order_id
+            assert got_item["qty"] == spec_item.qty, spec.order_id
+            assert got_item["unit_price"] == spec_item.unit_price, spec.order_id
 
 
 def test_exceptions_match_generator_intent(corpus):

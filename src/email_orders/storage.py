@@ -8,10 +8,15 @@ install.
 from __future__ import annotations
 
 import csv
+import os
+import shutil
 import sqlite3
+import tempfile
 from pathlib import Path
 
 from .models import ParsedException, ParsedOrder
+
+OUTPUT_FILES = ("orders.csv", "exceptions.csv", "orders.db")
 
 ORDER_FIELDS = ["message_id", "order_id", "shop", "date", "customer",
                 "items_json", "item_count", "total", "currency", "source"]
@@ -64,6 +69,23 @@ def write_sqlite(orders: list[ParsedOrder], exceptions: list[ParsedException], d
 
 
 def write_outputs(orders: list[ParsedOrder], exceptions: list[ParsedException], out_dir: str | Path) -> None:
+    """Writes orders.csv, exceptions.csv and orders.db as one atomic
+    "publication": everything is written into a staging directory first,
+    and only if all three writes succeed are they published over the
+    previous outputs, one `os.replace` (atomic on POSIX same-filesystem
+    renames) per file. If any staged write fails -- including a failure
+    partway through `write_sqlite` -- the staging directory is discarded
+    and the previous good outputs (if any) are left exactly as they were.
+    A run's outputs are never partially overwritten with an inconsistent
+    or empty snapshot.
+    """
     out_dir = Path(out_dir)
-    write_csv(orders, exceptions, out_dir)
-    write_sqlite(orders, exceptions, out_dir / "orders.db")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".stage-", dir=out_dir))
+    try:
+        write_csv(orders, exceptions, staging)
+        write_sqlite(orders, exceptions, staging / "orders.db")
+        for name in OUTPUT_FILES:
+            os.replace(staging / name, out_dir / name)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)

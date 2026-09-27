@@ -48,7 +48,8 @@ anywhere in it.
      currency, and which source it came from.
    - `exceptions.csv` (also in `orders.db`) -- one row per problem:
      category (`unparseable` / `missing_total` / `duplicate` /
-     `irrelevant`) and a human-readable detail.
+     `invalid_amount` / `invalid_order` / `irrelevant`) and a
+     human-readable detail.
 3. `demo` -- runs the whole thing once: generates the corpus, ingests it
    from the folder, then starts the local test IMAP server (loaded with
    the same messages), ingests it again over real IMAP, and confirms both
@@ -91,17 +92,31 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-16/16 passing:
+30/30 passing:
 - **Known-total reconciliation** (`test_generator_ground_truth.py`) -- the
   generator's own record of every order and total it wrote is compared
-  against the parser's output, exactly, plus a check that every one of the
-  13 messages lands in exactly one of the two tables (nothing dropped,
-  nothing double-counted) and that all four exception categories appear.
+  against the parser's output, exactly -- including every item's name,
+  quantity and unit price, not just the item count -- plus a check that
+  every one of the 13 messages lands in exactly one of the two tables
+  (nothing dropped, nothing double-counted) and that all four
+  generator-corpus exception categories appear.
 - **Failure-class tests** (`test_parser_failures.py`) -- one hand-built
   input per bad-input class (empty bytes, header-less binary junk, missing
   total, duplicate order id, irrelevant-from-a-known-shop, irrelevant from
   an unknown sender), independent of the generator's own corpus, plus one
   good-path sanity check.
+- **Probe-derived regression tests** (`test_parser_probes.py`) -- one test
+  per finding from the 2026-09-27 independent review: malformed/comma
+  decimals and bad item prices are rejected as `invalid_amount`, not
+  crashed on or silently reinterpreted; missing/contradictory currency, an
+  invalid calendar date, and zero item lines are rejected as
+  `invalid_order`, not published as an ordinary clean order; a complete
+  HTML body is not displaced by an unrelated text attachment, including
+  through nested multipart and an attachment-only message; the same order
+  id used by two different shops is two legitimate orders, not one order
+  plus a spurious duplicate; a missing source folder fails the CLI rather
+  than silently ingesting as empty, and a failed publish (e.g. a SQLite
+  open failure) never destroys the previous good CSV/SQLite snapshot.
 - **Pipeline tests** (`test_pipeline.py`) -- the local IMAP server binds to
   127.0.0.1 only and rejects a wrong login; IMAP-sourced and
   folder-sourced results match exactly; CSV and SQLite outputs agree with
@@ -128,7 +143,12 @@ never read anything from the secret store.
 - Each message's readable text is gathered from whichever it has: the
   plain-text part if present, otherwise the HTML part with tags stripped
   to text; a PDF attachment (if any) is extracted separately via
-  `pdfplumber` and used only as a fallback source for the total.
+  `pdfplumber` and used only as a fallback source for the total. Body-text
+  candidates are selected structurally by MIME disposition: a text/plain
+  or text/html part whose `Content-Disposition` is `attachment` (e.g. an
+  unrelated `notes.txt`) is never treated as the body, even if it's the
+  only text/plain part in the message and even inside nested multipart
+  structures.
 - **Shop identification**: by the `From:` address first; if that doesn't
   match a known shop (e.g. a forwarded message, now sent from the
   customer's own address), by the shop's display name appearing anywhere
@@ -141,9 +161,28 @@ never read anything from the secret store.
 - **Items** are parsed from a single `- name xQty @ price each` line
   format, shared by every template's plain-text rendition (and reproduced
   inside the `<li>` items of HTML-only bodies) -- see "Limits" below.
-- **Duplicate detection** is per ingest run: the first message to claim an
-  order id wins the `orders` row; every later message with the same order
-  id is flagged `duplicate`, never silently merged or overwritten.
+- **Supported numeric grammar**: a total or unit price must be plain
+  digits with exactly two decimal places (`12.34`) -- no thousands
+  separators, no comma decimal points, no scientific notation. Anything
+  else is rejected as `invalid_amount` rather than crashing the ingest run
+  or being silently reinterpreted (`1,25` is not guessed to mean `1.25`;
+  it's rejected).
+- **Field validation**: a recognised order must have an identifiable,
+  non-contradictory currency (a printed symbol and a printed 3-letter code
+  that disagree, e.g. `$10.00 EUR`, are rejected, not resolved in favour
+  of one of them), a real calendar date if a date is printed at all, and
+  at least one parseable item line. Any of these failing is flagged
+  `invalid_order`, never published as an ordinary clean order with a null
+  or zero-valued field.
+- **Duplicate detection** is per ingest run and scoped per shop: the first
+  message to claim an order id *for a given shop* wins the `orders` row;
+  a later message with the same order id from the *same* shop is flagged
+  `duplicate`. The same order id used by two different shops is two
+  independent, legitimate orders -- this demo's shops don't share an
+  order-id namespace, and nothing here assumes a client's shops would
+  either. Duplicate state is only recorded after a message passes every
+  other validation, so a message that fails validation never blocks a
+  later, valid message with the same order id.
 - **Missing total**: if no total is found in the body or any PDF
   attachment, the message is flagged `missing_total`, not guessed at or
   dropped.
@@ -152,6 +191,14 @@ never read anything from the secret store.
   an order row.
 - **Unparseable**: a message with no `From`/`Subject` header at all, or no
   text/HTML/PDF content that could be decoded, is flagged `unparseable`.
+- **Publication**: `ingest` reads the whole source before writing anything;
+  a missing/unreadable folder or a failed IMAP fetch fails the CLI (exit
+  code 2) rather than being read as "zero messages". Output is staged in a
+  temporary directory and published (one atomic file replace per output)
+  only once every output has been written successfully -- a failure
+  partway through publishing (e.g. the SQLite file can't be opened) leaves
+  the previous run's `orders.csv` / `exceptions.csv` / `orders.db`
+  untouched instead of replacing them with an empty or partial snapshot.
 
 ## Limits
 
@@ -168,8 +215,9 @@ never read anything from the secret store.
 - Currency is read from the printed 3-letter code or the `$`/`€`/`£`
   symbol; there is no FX conversion anywhere in this project.
 - Duplicate-order-id detection is scoped to one `ingest` run's input
-  (a folder, or a mailbox snapshot at fetch time), not a persistent
-  cross-run registry.
+  (a folder, or a mailbox snapshot at fetch time) *and* to one shop within
+  that run, not a persistent cross-run registry and not a cross-shop
+  global namespace.
 - The IMAP server is a minimal test fixture (`LOGIN`, `SELECT`, `SEARCH
   ALL`, `FETCH (RFC822)`, `LOGOUT`), not a general-purpose mail server --
   it exists to prove the ingestion code speaks real IMAP, not to replace
@@ -193,5 +241,11 @@ LICENSES.md       every open-source library used and its licence
 
 ## Role
 
-Automation engineer -- designed and directed the build (AI-assisted
-coding), the same way as this profile's other sanitized demos.
+AI-assisted build: an AI coding agent (Claude) wrote this repository's
+code, tests and generator from a brief set by this profile's owner, who
+specified the requirements (parse order emails to a table; cover multiple
+formats/encodings/attachment types; include a local test IMAP path),
+reviewed the resulting design, and verified its behaviour by running and
+extending the automated test suite. No personal, pre-existing
+email-parsing engagement is claimed -- this is a synthetic capability
+demo, not a record of past client work.

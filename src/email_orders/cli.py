@@ -35,10 +35,17 @@ def cmd_generate(args: argparse.Namespace) -> None:
 
 
 def cmd_ingest(args: argparse.Namespace) -> None:
-    if args.source == "folder":
-        messages = imap_source.read_folder(args.input)
-    else:
-        messages = imap_source.read_imap(args.host, args.port, args.user, args.password, args.mailbox)
+    try:
+        if args.source == "folder":
+            messages = imap_source.read_folder(args.input)
+        else:
+            messages = imap_source.read_imap(args.host, args.port, args.user, args.password, args.mailbox)
+    except (FileNotFoundError, OSError, RuntimeError) as exc:
+        # A missing/unreadable source is an ingest failure, not an empty
+        # mailbox -- never write_outputs() here, or a previous good
+        # snapshot would be silently replaced with zero orders/exceptions.
+        print(f"error: could not read {args.source} source: {exc}", file=sys.stderr)
+        sys.exit(2)
     orders, exceptions = run_ingest(messages, args.source)
     write_outputs(orders, exceptions, args.out)
     print(f"[{args.source}] {len(messages)} messages -> {len(orders)} orders, "
