@@ -234,8 +234,18 @@ never read anything from the secret store.
   pointing at the previous, complete generation, untouched -- a reader
   resolving `current` at any moment sees either the old complete snapshot
   or the new complete one, never a partial or inconsistent mix of the
-  two. Old generations are then removed as a best-effort cleanup step
-  that can never affect what `current` points at.
+  two. A reader that opens more than one file in a single logical read
+  should resolve `current` once (`storage.pin_current`) and use that one
+  resolved path for every open, rather than re-deriving a path from
+  `current` per file. `write_outputs` never deletes an old generation
+  itself -- every generation stays on disk under `.generations/` until
+  something explicitly prunes it (`storage.prune_generations`, a
+  separate, manually-invoked offline step this demo's CLI never calls),
+  so a reader that pinned a generation can keep reading it indefinitely.
+  This trades unbounded disk growth for correctness: there is no
+  automatic, in-process garbage collection here, and no lock or
+  reference-counting scheme -- pruning is safe only when run offline,
+  during a window with no readers still pinned to an old generation.
 
 ## Limits
 

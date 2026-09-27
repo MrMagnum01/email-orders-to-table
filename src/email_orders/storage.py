@@ -11,6 +11,7 @@ import csv
 import os
 import shutil
 import sqlite3
+import time
 import uuid
 from pathlib import Path
 
@@ -77,8 +78,36 @@ def current_dir(out_dir: str | Path) -> Path:
     always go through this -- never assume the three files live directly
     in `out_dir` -- because publication (below) switches generations by
     repointing this symlink, not by writing into `out_dir` directly.
+
+    This returns the symlink path itself, not a resolved directory: two
+    calls can resolve to two different generations if a publish lands in
+    between. A reader that will open more than one file in a single
+    logical read (e.g. both CSVs and the DB, or the DB more than once)
+    must pin one generation for that whole read -- see `pin_current`.
     """
     return Path(out_dir) / CURRENT_LINK
+
+
+def pin_current(out_dir: str | Path) -> Path:
+    """Resolves `current` once, to the concrete generation directory it
+    points at right now, and returns that concrete path for a reader to
+    use for every file it opens in one logical read.
+
+    Use this instead of re-deriving a path from `current_dir` for each
+    file: `current` can be repointed by a concurrent `write_outputs` call
+    between two opens, and re-resolving it each time could silently mix
+    files from two different generations. Resolve once, up front, and
+    open every file (`orders.csv`, `exceptions.csv`, `orders.db`) under
+    the single path this returns.
+
+    The generation this returns is never deleted by `write_outputs`
+    itself (see its docstring) -- only `prune_generations`, an explicit,
+    separately-invoked offline step, ever removes an old generation. So a
+    reader that pinned a generation this way can keep reading it for as
+    long as it needs, provided nothing runs `prune_generations` while it
+    does.
+    """
+    return current_dir(out_dir).resolve()
 
 
 def write_outputs(orders: list[ParsedOrder], exceptions: list[ParsedException], out_dir: str | Path) -> None:
@@ -105,17 +134,23 @@ def write_outputs(orders: list[ParsedOrder], exceptions: list[ParsedException], 
     any moment sees either the old complete generation or the new
     complete one -- never a mix of the two, and never a mid-write file.
 
-    Old generations are then removed as a best-effort cleanup step; a
-    failure there can leave a stale generation directory on disk, but it
-    can never affect what `current` points at or make an old generation's
-    files disappear out from under a reader that already resolved
-    `current`.
+    `write_outputs` never deletes an old generation itself. Every
+    generation it has ever built stays on disk under `.generations/`
+    until something explicitly prunes it (see `prune_generations`) --
+    deliberately, so that a reader who pinned a generation via
+    `pin_current` before this call can keep reading those files
+    afterwards no matter how many further publications happen. Cleanup is
+    a separate, manually-invoked, offline operation precisely so it can
+    never run concurrently with -- and race -- a live reader.
     """
     out_dir = Path(out_dir)
     generations_root = out_dir / GENERATIONS_DIR
     generations_root.mkdir(parents=True, exist_ok=True)
 
-    gen_name = f"gen-{uuid.uuid4().hex}"
+    # The timestamp prefix makes generation names sort in creation order,
+    # which `prune_generations` relies on to find the newest ones; the
+    # uuid suffix keeps names unique even at identical timestamps.
+    gen_name = f"gen-{time.time_ns():020d}-{uuid.uuid4().hex}"
     gen_dir = generations_root / gen_name
     gen_dir.mkdir()
     try:
@@ -137,11 +172,42 @@ def write_outputs(orders: list[ParsedOrder], exceptions: list[ParsedException], 
         shutil.rmtree(gen_dir, ignore_errors=True)
         raise
 
-    # Best-effort cleanup: remove every generation except the one
-    # `current` now points at. Never runs before the switch above, so it
-    # can never race a reader that is still resolving the previous
-    # generation through `current`.
-    live_name = os.readlink(out_dir / CURRENT_LINK)
-    for child in generations_root.iterdir():
-        if child.name != Path(live_name).name:
+
+def prune_generations(out_dir: str | Path, keep: int = 3) -> list[Path]:
+    """Removes old generations under `out_dir/.generations/`, keeping the
+    `keep` most recently-created ones plus whichever one `current` points
+    at (even if it has fallen out of the newest `keep` by creation time).
+
+    This is a separate, manually-invoked, offline maintenance operation --
+    `write_outputs` never calls it, and it must not be run while a reader
+    might still be using an older generation. There is no lock or
+    reference count here, only the retention count `keep`; run it during
+    a maintenance window (e.g. from a cron job), not from inside a live
+    ingest process, and pick `keep` generously enough to outlast your
+    slowest reader.
+
+    Returns the list of removed generation directories.
+    """
+    out_dir = Path(out_dir)
+    generations_root = out_dir / GENERATIONS_DIR
+    if not generations_root.is_dir():
+        return []
+
+    live_link = out_dir / CURRENT_LINK
+    live_target = Path(os.readlink(live_link)).name if live_link.is_symlink() else None
+
+    all_gens = sorted(
+        (c for c in generations_root.iterdir() if c.is_dir()),
+        key=lambda p: p.name,
+        reverse=True,
+    )
+    keep_names = {g.name for g in all_gens[:keep]}
+    if live_target:
+        keep_names.add(live_target)
+
+    removed = []
+    for child in all_gens:
+        if child.name not in keep_names:
             shutil.rmtree(child, ignore_errors=True)
+            removed.append(child)
+    return removed

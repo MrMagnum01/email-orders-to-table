@@ -302,6 +302,63 @@ def test_failed_generation_switch_preserves_previous_publication(tmp_path, monke
     assert (live / "orders.csv").read_text().splitlines() == before_csv_rows
 
 
+# -- 2026-09-27 pin-probe follow-up (item 1 of
+# ~/vault/40-sessions/2026-09-27-astra-email-orders-to-table-remaining-
+# findings.md, reproduced by -pin-probe.py / -pin-result.json): cleanup used
+# to delete every generation except the brand-new one on each publish, so a
+# reader that had already resolved `current` to the old generation found its
+# files gone before it finished reading them. `write_outputs` no longer
+# deletes old generations at all -- see its and `prune_generations`'s
+# docstrings in storage.py. --
+
+def test_pinned_generation_survives_later_publications(tmp_path):
+    """A reader that pins a generation with `storage.pin_current` before
+    further publications must still be able to read every file in it
+    afterwards, no matter how many more publications land."""
+    old = parse_eml(_message(_body()).as_bytes(), "old", "folder", {})
+    storage.write_outputs([old], [], tmp_path)
+    pinned = storage.pin_current(tmp_path)
+    pinned_db_bytes = (pinned / "orders.db").read_bytes()
+    pinned_csv_rows = (pinned / "orders.csv").read_text().splitlines()
+
+    # Several further publications land while the reader is still "reading"
+    # the generation it pinned before any of them happened.
+    for i in range(3):
+        new = parse_eml(_message(_body(total=f"${20 + i}.00 USD")).as_bytes(),
+                         f"new-{i}", "folder", {})
+        storage.write_outputs([new], [], tmp_path)
+
+    # The pinned generation directory, and its files, are still exactly as
+    # they were -- nothing removed them out from under the reader.
+    assert pinned.exists()
+    assert (pinned / "orders.db").read_bytes() == pinned_db_bytes
+    assert (pinned / "orders.csv").read_text().splitlines() == pinned_csv_rows
+
+    # `current` has moved on to a different, newer generation.
+    assert storage.current_dir(tmp_path).resolve() != pinned
+
+
+def test_prune_generations_keeps_newest_n_and_the_live_one(tmp_path):
+    """`prune_generations` is the only thing in this module that ever
+    deletes a generation, and `write_outputs` never calls it -- pruning is
+    a separate, manually-invoked offline step (see its docstring)."""
+    for i in range(5):
+        o = parse_eml(_message(_body(total=f"${10 + i}.00 USD")).as_bytes(),
+                       f"m-{i}", "folder", {})
+        storage.write_outputs([o], [], tmp_path)
+
+    live_target = Path(os.readlink(tmp_path / "current")).name
+    all_before = {p.name for p in (tmp_path / storage.GENERATIONS_DIR).iterdir()}
+    assert len(all_before) == 5  # write_outputs pruned nothing along the way
+
+    removed = storage.prune_generations(tmp_path, keep=2)
+    remaining = {p.name for p in (tmp_path / storage.GENERATIONS_DIR).iterdir()}
+
+    assert len(remaining) == 2
+    assert live_target in remaining  # the live generation is never pruned
+    assert {p.name for p in removed} == all_before - remaining
+
+
 # -- 2026-09-27 re-review follow-up (rereview.md findings 2 and 3) --
 # Scenarios adapted (paths only, per the module docstring) from
 # ~/vault/40-sessions/2026-09-27-astra-email-orders-to-table-rereview-probes.py.
