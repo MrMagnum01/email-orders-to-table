@@ -13,5 +13,5 @@ OUT="${1:-data}"
 python3 -m email_orders demo --out "$OUT" --seed 42
 
 echo
-echo "Done. See $OUT/output-folder/ and $OUT/output-imap/ for"
+echo "Done. See $OUT/output-folder/current/ and $OUT/output-imap/current/ for"
 echo "orders.csv, exceptions.csv and orders.db (SQLite)."

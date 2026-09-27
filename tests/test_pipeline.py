@@ -10,7 +10,7 @@ from pathlib import Path
 from email_orders.cli import TEST_IMAP_PASSWORD, TEST_IMAP_USER, run_ingest
 from email_orders.imap_server import SyntheticIMAPServer
 from email_orders.imap_source import read_folder, read_imap
-from email_orders.storage import write_outputs
+from email_orders.storage import current_dir, write_outputs
 
 SRC = Path(__file__).resolve().parent.parent / "src"
 
@@ -70,15 +70,16 @@ def test_storage_writes_matching_csv_and_sqlite(tmp_path, corpus):
     orders, exceptions = run_ingest(messages, "folder")
     out_dir = tmp_path / "output"
     write_outputs(orders, exceptions, out_dir)
+    live = current_dir(out_dir)
 
-    with open(out_dir / "orders.csv", newline="", encoding="utf-8") as fh:
+    with open(live / "orders.csv", newline="", encoding="utf-8") as fh:
         csv_orders = list(csv.DictReader(fh))
-    with open(out_dir / "exceptions.csv", newline="", encoding="utf-8") as fh:
+    with open(live / "exceptions.csv", newline="", encoding="utf-8") as fh:
         csv_exceptions = list(csv.DictReader(fh))
     assert len(csv_orders) == len(orders)
     assert len(csv_exceptions) == len(exceptions)
 
-    conn = sqlite3.connect(out_dir / "orders.db")
+    conn = sqlite3.connect(live / "orders.db")
     try:
         db_orders = conn.execute("SELECT order_id, total, currency FROM orders").fetchall()
         db_exceptions = conn.execute("SELECT message_id, category FROM exceptions").fetchall()
@@ -102,7 +103,7 @@ def test_cli_demo_subprocess_smoke(tmp_path):
     )
     assert proc.returncode == 0, proc.stdout + proc.stderr
     assert "OK: folder-sourced and IMAP-sourced orders match exactly." in proc.stdout
-    assert (out / "output-folder" / "orders.csv").exists()
-    assert (out / "output-folder" / "exceptions.csv").exists()
-    assert (out / "output-folder" / "orders.db").exists()
-    assert (out / "output-imap" / "orders.csv").exists()
+    assert (current_dir(out / "output-folder") / "orders.csv").exists()
+    assert (current_dir(out / "output-folder") / "exceptions.csv").exists()
+    assert (current_dir(out / "output-folder") / "orders.db").exists()
+    assert (current_dir(out / "output-imap") / "orders.csv").exists()

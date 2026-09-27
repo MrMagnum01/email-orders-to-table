@@ -28,11 +28,26 @@ SYMBOL_CURRENCY = {"$": "USD", "€": "EUR", "£": "GBP"}
 
 ORDER_ID_RE = re.compile(r"Order\s*(?:ID|Number|Ref|#)\s*:\s*([A-Za-z]{2,4}-\d{3,6})", re.IGNORECASE)
 CUSTOMER_RE = re.compile(r"Customer\s*:\s*(.+)")
-DATE_RE = re.compile(r"Order date\s*:\s*(\d{4}-\d{2}-\d{2})")
+# Matches the whole printed value after "Order date:", however it's
+# spelled -- not just a value already shaped like an ISO date. Used to
+# tell "no date field printed at all" (fine; the order has no date) apart
+# from "a date field is printed but its value isn't a real ISO date"
+# (an `invalid_order`, not a null date) -- see `_parse_date`.
+DATE_LABEL_RE = re.compile(r"Order date\s*:\s*(\S.*?)\s*$", re.MULTILINE)
+ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+# One item line, in the one line format every shop template uses. Also
+# used, via `ITEM_BULLET_RE` below, to recognise a line that *looks* like
+# an item bullet but doesn't fully match this shape -- see `_parse_items`.
 ITEM_RE = re.compile(
     r"^\s*-\s*(.+?)\s+x(\d+)\s+@\s*([\$€£])?\s*([^\s]+)\s*(?:each)?\s*$",
     re.MULTILINE,
 )
+# Deliberately requires at least one whitespace char right after the
+# leading "-" (matching the one space every template's real item lines
+# use, "- name..."), so a decorative separator line made only of dashes
+# (e.g. the forwarded-message template's "---------- Forwarded message
+# ----------") is never mistaken for a malformed item bullet.
+ITEM_BULLET_RE = re.compile(r"^\s*-\s+\S.*$", re.MULTILINE)
 TOTAL_RE = re.compile(
     r"(?:Order total|Total charged|Amount due|Total paid)\s*:\s*"
     r"([\$€£])?\s*([^\s]+?)\s*(USD|EUR|GBP)?\s*$",
@@ -65,11 +80,14 @@ class MoneyError(ValueError):
 
 
 class OrderFieldError(ValueError):
-    """Raised for a recognised order whose required fields don't validate
-    (contradictory currency, no currency at all, an uncalendrical date, or
-    no item lines). Caught in `parse_eml` and turned into an
+    """Raised for a recognised order whose required fields don't validate:
+    contradictory total currency (symbol vs. code), no currency at all,
+    a printed order-date value that isn't a real ISO calendar date, no
+    item lines, an item line whose own currency symbol disagrees with the
+    order's total currency, or an item bullet line that doesn't match the
+    supported line format. Caught in `parse_eml` and turned into an
     `invalid_order` exception row -- never silently published as an
-    ordinary clean order."""
+    ordinary clean order with a null, dropped or reinterpreted field."""
 
 
 def _strip_html(s: str) -> str:
@@ -105,6 +123,45 @@ def _pdf_text(payload: bytes) -> str:
         return ""
 
 
+def _iter_body_candidate_parts(part: Message):
+    """Recursively yields every non-multipart (leaf) part reachable from
+    `part`, except that a part which is itself an *attachment container*
+    -- `is_multipart()` and `Content-Disposition: attachment` -- is never
+    descended into, so none of its own nested parts are yielded either.
+
+    This is a hand-rolled walk rather than `Message.walk()` specifically
+    because `Message.is_multipart()` (and so `walk()`) treats *any* part
+    whose payload is a list as descendable -- which includes a
+    `message/rfc822` attachment (an email attached to this one): its
+    payload is a one-item list holding the embedded `Message`, so
+    `walk()` happily descends into that attached email's own MIME tree
+    and yields its body parts as if they belonged to the outer message.
+    An attached email nearly always has its own decodable text/plain or
+    text/html part, so that part -- not the real body -- would win the
+    "first plain-text part" (or any part-order-dependent) selection.
+    Pruning the whole subtree at the *container* boundary, rather than
+    only skipping a leaf part whose own disposition is `attachment`, is
+    what makes this correct for an attached message/rfc822 email or an
+    attached multipart bundle, not just an attached single file.
+
+    A genuine *leaf* attachment (not a container) -- e.g. a PDF receipt
+    with `Content-Disposition: attachment` -- is still yielded here: this
+    demo deliberately reads a PDF attachment's text as a fallback total
+    source regardless of its disposition (see `_gather_text`), and a
+    leaf can never itself hide further nested parts the way a container
+    can. Per-content-type leaf rules (e.g. "a text/plain or text/html
+    leaf whose disposition is `attachment` is not a body candidate") are
+    applied by the caller, not here.
+    """
+    if part.is_multipart():
+        if part.get_content_disposition() == "attachment":
+            return
+        for sub in part.get_payload():
+            yield from _iter_body_candidate_parts(sub)
+    else:
+        yield part
+
+
 def _gather_text(msg: Message) -> tuple[str | None, str, bool]:
     """Splits the message into (body_text, pdf_text, ok).
 
@@ -118,11 +175,16 @@ def _gather_text(msg: Message) -> tuple[str | None, str, bool]:
     text/html or application/pdf part at all, or none of them could be
     decoded.
 
-    A text/plain or text/html part whose Content-Disposition is
-    `attachment` (e.g. an unrelated `notes.txt`) is never treated as a
-    body candidate -- only the actual message body (no disposition, or
-    `inline`) is. Selection is structural (disposition), not "whichever
-    plain-text part comes first in `walk()`".
+    Body candidates are gathered via `_iter_body_candidate_parts`, which
+    prunes every attachment *container* (by Content-Disposition) at the
+    boundary rather than only excluding attachment leaves -- see that
+    function's docstring for why a leaf-only check misses an attached
+    message/rfc822 email. On top of that, a text/plain or text/html leaf
+    whose own Content-Disposition is `attachment` (e.g. an unrelated
+    `notes.txt`) is never treated as a body candidate here either -- only
+    the actual message body (no disposition, or `inline`) is. A PDF leaf
+    is read regardless of its disposition (see above). Selection is
+    structural throughout, not "whichever plain-text part comes first".
     """
     plain_chunks: list[str] = []
     html_chunks: list[str] = []
@@ -130,10 +192,7 @@ def _gather_text(msg: Message) -> tuple[str | None, str, bool]:
     found_content_part = False
     decoded_anything = False
 
-    parts = msg.walk() if msg.is_multipart() else [msg]
-    for part in parts:
-        if part.is_multipart():
-            continue
+    for part in _iter_body_candidate_parts(msg):
         ctype = part.get_content_type()
         disposition = part.get_content_disposition()  # 'attachment' | 'inline' | None
         if ctype in ("text/plain", "text/html") and disposition == "attachment":
@@ -223,21 +282,58 @@ def _parse_total(text: str) -> tuple[float | None, str | None]:
     return value, currency
 
 
-def _parse_items(text: str) -> list[dict]:
+def _parse_items(text: str, order_currency: str | None) -> list[dict]:
     """Raises `MoneyError` if any item's unit price doesn't match the
-    supported numeric grammar."""
+    supported numeric grammar. Raises `OrderFieldError` if an item's
+    printed currency symbol disagrees with the order's own currency (an
+    item quietly priced in a different currency than the total is a
+    contradictory order, not a detail to drop), or if any line that
+    *looks* like an item bullet (starts with `- `) doesn't fully match
+    the supported `- name xQty @ price each` shape -- accepting every
+    line that happens to match while silently skipping the rest would
+    quietly drop malformed items instead of flagging the order.
+    """
+    bullet_lines = ITEM_BULLET_RE.findall(text)
     items = []
-    for name, qty, _symbol, price in ITEM_RE.findall(text):
-        items.append({"name": name.strip(), "qty": int(qty), "unit_price": _validate_money(price)})
+    for name, qty, symbol, price in ITEM_RE.findall(text):
+        value = _validate_money(price)
+        item_currency = SYMBOL_CURRENCY.get(symbol) if symbol else None
+        if item_currency and order_currency and item_currency != order_currency:
+            raise OrderFieldError(
+                f"item {name.strip()!r} is priced with currency symbol {symbol!r} "
+                f"({item_currency}) but the order total is in {order_currency}; "
+                "contradictory currency"
+            )
+        items.append({"name": name.strip(), "qty": int(qty), "unit_price": value})
+    if len(items) != len(bullet_lines):
+        raise OrderFieldError(
+            f"found {len(bullet_lines)} item line(s) but only {len(items)} matched "
+            "the supported '- name xQty @ price each' format; refusing to silently "
+            "drop the rest"
+        )
     return items
 
 
-def _is_valid_calendar_date(date_str: str) -> bool:
+def _parse_date(text: str) -> str | None:
+    """Returns the printed order date, or None if no "Order date:" label
+    is printed at all (a missing date field is fine -- see
+    `ParsedOrder.date`). Raises `OrderFieldError` if the label *is*
+    printed but its value isn't a real ISO calendar date (`not-a-date`,
+    `2026-99-99`, or anything else `date.fromisoformat` rejects) -- a
+    printed-but-garbled date must never become a silent null date on an
+    otherwise clean order.
+    """
+    m = DATE_LABEL_RE.search(text)
+    if not m:
+        return None
+    raw = m.group(1)
+    if not ISO_DATE_RE.match(raw):
+        raise OrderFieldError(f"order date {raw!r} is not a valid ISO calendar date (YYYY-MM-DD)")
     try:
-        date.fromisoformat(date_str)
-        return True
+        date.fromisoformat(raw)
     except ValueError:
-        return False
+        raise OrderFieldError(f"order date {raw!r} is not a valid calendar date") from None
+    return raw
 
 
 def parse_eml(raw: bytes, message_id: str, source: str,
@@ -310,9 +406,11 @@ def parse_eml(raw: bytes, message_id: str, source: str,
         )
 
     try:
-        items = _parse_items(body_text)
+        items = _parse_items(body_text, currency)
     except MoneyError as exc:
         return ParsedException(message_id, "invalid_amount", str(exc), source)
+    except OrderFieldError as exc:
+        return ParsedException(message_id, "invalid_order", str(exc), source)
 
     if not items:
         return ParsedException(
@@ -320,13 +418,10 @@ def parse_eml(raw: bytes, message_id: str, source: str,
             f"recognised order {order_id} has no parseable item lines", source,
         )
 
-    date_m = DATE_RE.search(body_text)
-    date_value = date_m.group(1) if date_m else None
-    if date_value is not None and not _is_valid_calendar_date(date_value):
-        return ParsedException(
-            message_id, "invalid_order",
-            f"order {order_id} has an invalid calendar date {date_value!r}", source,
-        )
+    try:
+        date_value = _parse_date(body_text)
+    except OrderFieldError as exc:
+        return ParsedException(message_id, "invalid_order", str(exc), source)
 
     seen_order_ids[dup_key] = message_id
     customer_m = CUSTOMER_RE.search(body_text)

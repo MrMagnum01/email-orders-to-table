@@ -42,7 +42,9 @@ anywhere in it.
      from a real shop address, one not);
    - one **structurally broken** file (no headers, undecodable body).
 2. `ingest --source folder|imap` -- reads every message from a directory
-   of `.eml` files, or from a mailbox on an IMAP server, and writes:
+   of `.eml` files, or from a mailbox on an IMAP server, and publishes,
+   under `--out/current/` (see "Publication" below for what `current` is
+   and why):
    - `orders.csv` + `orders.db` (SQLite) -- one row per order: message id,
      order id, shop, date, customer, items (JSON), item count, total,
      currency, and which source it came from.
@@ -71,8 +73,9 @@ pip install -r requirements.txt
 ```
 
 Writes the synthetic corpus to `data/eml/`, then both output sets to
-`data/output-folder/` and `data/output-imap/` (identical, from the two
-different sources). `data/` is git-ignored -- it's generated, not source.
+`data/output-folder/current/` and `data/output-imap/current/` (identical,
+from the two different sources). `data/` is git-ignored -- it's
+generated, not source.
 
 ## CLI, step by step
 
@@ -84,6 +87,10 @@ python -m email_orders ingest --source folder --input data/eml --out data/output
 python -m email_orders demo --out data --seed 42   # folder + IMAP in one go
 ```
 
+`--out` names the *root* directory for a given ingest; the published
+files land in `<out>/current/` (see "Publication" below), not directly
+in `<out>/`.
+
 ## Tests
 
 ```bash
@@ -92,7 +99,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-30/30 passing:
+35/35 passing:
 - **Known-total reconciliation** (`test_generator_ground_truth.py`) -- the
   generator's own record of every order and total it wrote is compared
   against the parser's output, exactly -- including every item's name,
@@ -106,17 +113,23 @@ pytest tests -v
   an unknown sender), independent of the generator's own corpus, plus one
   good-path sanity check.
 - **Probe-derived regression tests** (`test_parser_probes.py`) -- one test
-  per finding from the 2026-09-27 independent review: malformed/comma
-  decimals and bad item prices are rejected as `invalid_amount`, not
-  crashed on or silently reinterpreted; missing/contradictory currency, an
-  invalid calendar date, and zero item lines are rejected as
-  `invalid_order`, not published as an ordinary clean order; a complete
-  HTML body is not displaced by an unrelated text attachment, including
-  through nested multipart and an attachment-only message; the same order
-  id used by two different shops is two legitimate orders, not one order
-  plus a spurious duplicate; a missing source folder fails the CLI rather
-  than silently ingesting as empty, and a failed publish (e.g. a SQLite
-  open failure) never destroys the previous good CSV/SQLite snapshot.
+  per finding from the 2026-09-27 independent review and its 2026-09-27
+  re-review follow-up: malformed/comma decimals and bad item prices are
+  rejected as `invalid_amount`, not crashed on or silently reinterpreted;
+  missing/contradictory total currency, an item priced in a currency that
+  disagrees with the total, a printed-but-garbled date, an item line that
+  doesn't match the supported format, and zero item lines are all
+  rejected as `invalid_order`, not published as an ordinary clean order
+  with a null, dropped or reinterpreted field; a complete HTML body is
+  not displaced by an unrelated text attachment or an attached
+  `message/rfc822` email, including through nested multipart and an
+  attachment-only message; the same order id used by two different shops
+  is two legitimate orders, not one order plus a spurious duplicate; a
+  missing source folder fails the CLI rather than silently ingesting as
+  empty; and a failed publish -- whether the failure is building the new
+  generation (e.g. a SQLite open failure) or in the one commit point that
+  switches `current` to it -- never moves `current` off the previous
+  good, complete generation.
 - **Pipeline tests** (`test_pipeline.py`) -- the local IMAP server binds to
   127.0.0.1 only and rejects a wrong login; IMAP-sourced and
   folder-sourced results match exactly; CSV and SQLite outputs agree with
@@ -148,7 +161,12 @@ never read anything from the secret store.
   or text/html part whose `Content-Disposition` is `attachment` (e.g. an
   unrelated `notes.txt`) is never treated as the body, even if it's the
   only text/plain part in the message and even inside nested multipart
-  structures.
+  structures. An *attachment container* -- anything with
+  `Content-Disposition: attachment` that itself holds nested parts, such
+  as an attached `message/rfc822` email or an attached multipart bundle
+  -- is never descended into at all, so none of its own nested body-like
+  parts (e.g. the attached email's own plain-text part) can be mistaken
+  for this message's body.
 - **Shop identification**: by the `From:` address first; if that doesn't
   match a known shop (e.g. a forwarded message, now sent from the
   customer's own address), by the shop's display name appearing anywhere
@@ -161,6 +179,11 @@ never read anything from the secret store.
 - **Items** are parsed from a single `- name xQty @ price each` line
   format, shared by every template's plain-text rendition (and reproduced
   inside the `<li>` items of HTML-only bodies) -- see "Limits" below.
+  Every line that starts with `- ` is expected to be an item in this
+  format; a line that looks like an item bullet but doesn't fully match
+  it (e.g. a non-numeric quantity) is not silently skipped -- the whole
+  order is rejected as `invalid_order` rather than publishing a partial
+  item list.
 - **Supported numeric grammar**: a total or unit price must be plain
   digits with exactly two decimal places (`12.34`) -- no thousands
   separators, no comma decimal points, no scientific notation. Anything
@@ -170,10 +193,15 @@ never read anything from the secret store.
 - **Field validation**: a recognised order must have an identifiable,
   non-contradictory currency (a printed symbol and a printed 3-letter code
   that disagree, e.g. `$10.00 EUR`, are rejected, not resolved in favour
-  of one of them), a real calendar date if a date is printed at all, and
-  at least one parseable item line. Any of these failing is flagged
-  `invalid_order`, never published as an ordinary clean order with a null
-  or zero-valued field.
+  of one of them); every item's own printed currency symbol, if any, must
+  agree with the order's total currency (an item quietly priced in a
+  different currency is rejected, not silently dropped); a real calendar
+  date if a date field is printed at all (a printed-but-garbled date, e.g.
+  `not-a-date`, is rejected -- not the same as no date field being printed
+  at all, which is fine); and at least one parseable item line. Any of
+  these failing is flagged `invalid_order`, never published as an
+  ordinary clean order with a null, zero-valued, or partially dropped
+  field.
 - **Duplicate detection** is per ingest run and scoped per shop: the first
   message to claim an order id *for a given shop* wins the `orders` row;
   a later message with the same order id from the *same* shop is flagged
@@ -193,12 +221,21 @@ never read anything from the secret store.
   text/HTML/PDF content that could be decoded, is flagged `unparseable`.
 - **Publication**: `ingest` reads the whole source before writing anything;
   a missing/unreadable folder or a failed IMAP fetch fails the CLI (exit
-  code 2) rather than being read as "zero messages". Output is staged in a
-  temporary directory and published (one atomic file replace per output)
-  only once every output has been written successfully -- a failure
-  partway through publishing (e.g. the SQLite file can't be opened) leaves
-  the previous run's `orders.csv` / `exceptions.csv` / `orders.db`
-  untouched instead of replacing them with an empty or partial snapshot.
+  code 2) rather than being read as "zero messages". Each run's
+  `orders.csv` / `exceptions.csv` / `orders.db` are written *complete*
+  into a fresh, never-before-published generation directory under
+  `<out>/.generations/`; nothing a reader can already see is touched
+  while that happens. Publication then has exactly **one** commit point:
+  a symlink named `current` is built under a temporary name and moved
+  onto `<out>/current` with a single atomic rename. Readers always open
+  files through `<out>/current/`, never `<out>/` directly. A failure
+  while building the new generation (e.g. the SQLite file can't be
+  opened) or an interruption before that one rename leaves `current`
+  pointing at the previous, complete generation, untouched -- a reader
+  resolving `current` at any moment sees either the old complete snapshot
+  or the new complete one, never a partial or inconsistent mix of the
+  two. Old generations are then removed as a best-effort cleanup step
+  that can never affect what `current` points at.
 
 ## Limits
 
@@ -241,11 +278,7 @@ LICENSES.md       every open-source library used and its licence
 
 ## Role
 
-AI-assisted build: an AI coding agent (Claude) wrote this repository's
-code, tests and generator from a brief set by this profile's owner, who
-specified the requirements (parse order emails to a table; cover multiple
-formats/encodings/attachment types; include a local test IMAP path),
-reviewed the resulting design, and verified its behaviour by running and
-extending the automated test suite. No personal, pre-existing
-email-parsing engagement is claimed -- this is a synthetic capability
-demo, not a record of past client work.
+Synthetic portfolio demonstration, implemented with AI coding agents and
+independently reviewed by a separate AI reviewer. No client data or
+client work. No personal, pre-existing email-parsing engagement is
+claimed -- this is a capability demo, not a record of past client work.

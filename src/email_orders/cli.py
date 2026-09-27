@@ -49,7 +49,7 @@ def cmd_ingest(args: argparse.Namespace) -> None:
     orders, exceptions = run_ingest(messages, args.source)
     write_outputs(orders, exceptions, args.out)
     print(f"[{args.source}] {len(messages)} messages -> {len(orders)} orders, "
-          f"{len(exceptions)} exceptions. Written to {args.out}/")
+          f"{len(exceptions)} exceptions. Written to {args.out}/current/")
 
 
 def cmd_demo(args: argparse.Namespace) -> None:
@@ -65,7 +65,7 @@ def cmd_demo(args: argparse.Namespace) -> None:
     f_orders, f_exceptions = run_ingest(folder_messages, "folder")
     write_outputs(f_orders, f_exceptions, folder_out)
     print(f"folder ingest: {len(folder_messages)} messages -> "
-          f"{len(f_orders)} orders, {len(f_exceptions)} exceptions ({folder_out}/)")
+          f"{len(f_orders)} orders, {len(f_exceptions)} exceptions ({folder_out}/current/)")
 
     server = SyntheticIMAPServer(TEST_IMAP_USER, TEST_IMAP_PASSWORD)
     # Same messages, same order, served over a real (local-only) IMAP
@@ -79,7 +79,7 @@ def cmd_demo(args: argparse.Namespace) -> None:
         i_orders, i_exceptions = run_ingest(imap_messages, "imap")
         write_outputs(i_orders, i_exceptions, imap_out)
         print(f"imap ingest (127.0.0.1:{server.port}): {len(imap_messages)} messages -> "
-              f"{len(i_orders)} orders, {len(i_exceptions)} exceptions ({imap_out}/)")
+              f"{len(i_orders)} orders, {len(i_exceptions)} exceptions ({imap_out}/current/)")
     finally:
         server.stop()
 

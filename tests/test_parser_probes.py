@@ -27,6 +27,7 @@ source folder must not be read as "zero messages" and must not overwrite
 a previous good output; a failed publish (e.g. SQLite open failure) must
 leave the previous good CSV/DB snapshot exactly as it was.
 """
+import os
 import subprocess
 import sys
 from dataclasses import asdict
@@ -40,6 +41,13 @@ from email_orders.cli import run_ingest
 from email_orders.models import ParsedException, ParsedOrder
 from email_orders.parser import parse_eml
 from email_orders.shops import SHOPS
+
+# Paths adapted from ~/vault/40-sessions/2026-09-27-astra-email-orders-to-table-
+# rereview-probes.py (the 2026-09-27 re-review follow-up): that probe script
+# opened the published files directly under the output directory; storage.py
+# now publishes generations behind a `current` symlink (see storage.write_outputs),
+# so every probe below reads through `storage.current_dir(...)` instead. The
+# scenarios and assertions are otherwise the re-review's own follow-up cases.
 
 SHOP_LIST = list(SHOPS.values())
 
@@ -212,8 +220,9 @@ def test_same_order_id_same_shop_is_still_a_duplicate():
 def test_missing_source_folder_cli_fails_and_preserves_previous_output(tmp_path):
     old = parse_eml(_message(_body()).as_bytes(), "old", "folder", {})
     storage.write_outputs([old], [], tmp_path)
-    before_db = (tmp_path / "orders.db").read_bytes()
-    before_csv_rows = (tmp_path / "orders.csv").read_text().splitlines()
+    live = storage.current_dir(tmp_path)
+    before_db = (live / "orders.db").read_bytes()
+    before_csv_rows = (live / "orders.csv").read_text().splitlines()
 
     with pytest.raises(FileNotFoundError):
         imap_source.read_folder(tmp_path / "absent")
@@ -227,16 +236,20 @@ def test_missing_source_folder_cli_fails_and_preserves_previous_output(tmp_path)
     )
     assert proc.returncode != 0
     # The previous good snapshot must be untouched.
-    assert (tmp_path / "orders.db").read_bytes() == before_db
-    assert (tmp_path / "orders.csv").read_text().splitlines() == before_csv_rows
+    assert (live / "orders.db").read_bytes() == before_db
+    assert (live / "orders.csv").read_text().splitlines() == before_csv_rows
 
 
 def test_failed_sqlite_publish_preserves_previous_good_snapshot(tmp_path, monkeypatch):
     old = parse_eml(_message(_body()).as_bytes(), "old", "folder", {})
     storage.write_outputs([old], [], tmp_path)
-    before_db_exists = (tmp_path / "orders.db").exists()
-    before_csv_rows = (tmp_path / "orders.csv").read_text().splitlines()
-    assert before_db_exists
+    live = storage.current_dir(tmp_path)
+    before_target = os.readlink(live)
+    # Compare the database's actual bytes/content, not just that a file
+    # named orders.db exists -- an empty or truncated file would also
+    # "exist".
+    before_db_bytes = (live / "orders.db").read_bytes()
+    before_csv_rows = (live / "orders.csv").read_text().splitlines()
     assert len(before_csv_rows) == 2  # header + 1 order
 
     def fail(*a, **k):
@@ -246,7 +259,100 @@ def test_failed_sqlite_publish_preserves_previous_good_snapshot(tmp_path, monkey
     with pytest.raises(OSError):
         storage.write_outputs([], [], tmp_path)
 
-    assert (tmp_path / "orders.db").exists() == before_db_exists
-    assert (tmp_path / "orders.csv").read_text().splitlines() == before_csv_rows
-    # No leftover staging directory from the failed publish.
-    assert not any(p.name.startswith(".stage-") for p in tmp_path.iterdir())
+    # `current` was never repointed -- the failure happened while building
+    # the new generation, before the one commit point (the symlink swap).
+    assert os.readlink(live) == before_target
+    assert (live / "orders.db").read_bytes() == before_db_bytes
+    assert (live / "orders.csv").read_text().splitlines() == before_csv_rows
+    # The half-built new generation is cleaned up, not left as a stray
+    # directory that a later publish's cleanup pass would have to handle.
+    assert list((tmp_path / storage.GENERATIONS_DIR).iterdir()) == [
+        (tmp_path / storage.GENERATIONS_DIR / Path(before_target).name)
+    ]
+
+
+def test_failed_generation_switch_preserves_previous_publication(tmp_path, monkeypatch):
+    """Publication's one commit point is the `os.replace` that repoints
+    `current` onto the new, fully-written generation. Injecting a failure
+    there (simulating a crash mid-rename) must leave the previous
+    generation exactly as it was and `current` still resolving to it --
+    this is the case a three-separate-file-replace scheme could not give:
+    there is now exactly one commit point to fail at, not three."""
+    old = parse_eml(_message(_body()).as_bytes(), "old", "folder", {})
+    storage.write_outputs([old], [], tmp_path)
+    live = storage.current_dir(tmp_path)
+    before_target = os.readlink(live)
+    before_db = (live / "orders.db").read_bytes()
+    before_csv_rows = (live / "orders.csv").read_text().splitlines()
+
+    real_replace = storage.os.replace
+
+    def fail_on_symlink_swap(src, dst):
+        if str(src).startswith(str(tmp_path / ".current-")):
+            raise OSError("injected generation-switch failure")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(storage.os, "replace", fail_on_symlink_swap)
+    new = parse_eml(_message(_body(total="$20.00 USD")).as_bytes(), "new", "folder", {})
+    with pytest.raises(OSError):
+        storage.write_outputs([new], [], tmp_path)
+
+    assert os.readlink(live) == before_target
+    assert (live / "orders.db").read_bytes() == before_db
+    assert (live / "orders.csv").read_text().splitlines() == before_csv_rows
+
+
+# -- 2026-09-27 re-review follow-up (rereview.md findings 2 and 3) --
+# Scenarios adapted (paths only, per the module docstring) from
+# ~/vault/40-sessions/2026-09-27-astra-email-orders-to-table-rereview-probes.py.
+
+def test_garbled_printed_date_is_invalid_order_not_a_null_date():
+    """'Order date: not-a-date' must not become a clean order with a null
+    date -- the label is printed, so its value must be a real ISO date or
+    the order is rejected."""
+    raw = _message(_body(date="not-a-date")).as_bytes()
+    result = parse_eml(raw, "bad_date_text", "folder", {})
+    assert isinstance(result, ParsedException)
+    assert result.category == "invalid_order"
+
+
+def test_item_currency_conflicting_with_total_is_invalid_order():
+    """An item priced in euros under a dollar total must not be accepted
+    with the item's currency silently dropped."""
+    raw = _message(_body(items="- Widget x1 @ €10.00 each")).as_bytes()
+    result = parse_eml(raw, "item_currency_conflict", "folder", {})
+    assert isinstance(result, ParsedException)
+    assert result.category == "invalid_order"
+
+
+def test_one_malformed_item_line_rejects_the_whole_order():
+    """One valid item plus one item line that doesn't match the supported
+    format ('- Other xBAD @ $2.00 each') must not silently drop the
+    malformed line and publish the order with only the valid item."""
+    raw = _message(
+        _body(items="- Widget x1 @ $10.00 each\n- Other xBAD @ $2.00 each")
+    ).as_bytes()
+    result = parse_eml(raw, "partial_items", "folder", {})
+    assert isinstance(result, ParsedException)
+    assert result.category == "invalid_order"
+
+
+def test_attached_rfc822_message_never_overrides_the_real_html_body():
+    """A complete HTML order plus an attached, unrelated .eml message must
+    still parse from the real HTML body -- the attached email's own
+    plain-text child must never be selected instead."""
+    m = EmailMessage()
+    m["From"] = SHOP_LIST[0]["from_addr"]
+    m["Subject"] = "Synthetic order"
+    m.set_content(_body().replace("\n", "<br>"), subtype="html")
+    attached = EmailMessage()
+    attached["From"] = "someone@example.invalid"
+    attached["Subject"] = "Unrelated"
+    attached.set_content("Unrelated attached email body")
+    m.add_attachment(attached)
+
+    result = parse_eml(m.as_bytes(), "attached_message_overrides_body", "folder", {})
+    assert isinstance(result, ParsedOrder), asdict(result) if isinstance(result, ParsedException) else result
+    assert result.order_id == "TS-9001"
+    assert result.total == 10.0
+    assert result.item_count == 1
